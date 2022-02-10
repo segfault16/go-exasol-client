@@ -15,6 +15,7 @@
 package exasol
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -55,7 +56,7 @@ func (c *Conn) QuoteIdent(ident string, args ...interface{}) string {
 			sql := "SELECT LOWER(keyword) FROM sys.exa_sql_keywords WHERE reserved"
 			kwRes, _ := c.FetchChan(sql)
 			for col := range kwRes {
-				kw[col[0].(string)] = true
+				kw[col.Data[0].(string)] = true
 			}
 			keywords = kw
 		}
@@ -118,13 +119,20 @@ func (c *Conn) errorf(format string, args ...interface{}) error {
 	return err
 }
 
-func transposeToChan(ch chan<- []interface{}, matrix [][]interface{}) {
+func transposeToChan(ctx context.Context, ch chan<- FetchResult, matrix [][]interface{}) error {
 	// matrix is columnar ... this transposes it to rowular
 	for row := range matrix[0] {
 		ret := make([]interface{}, len(matrix))
 		for col := range matrix {
 			ret[col] = matrix[col][row]
 		}
-		ch <- ret
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ch <- FetchResult{Data: ret}:
+			// continue
+		}
+
 	}
+	return nil
 }

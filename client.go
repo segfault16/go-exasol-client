@@ -21,6 +21,7 @@
 package exasol
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -58,6 +59,8 @@ type ConnConf struct {
 	WSHandler      WSHandler // Optional for intercepting websocket traffic
 	CachePrepStmts bool
 
+	FetchReqSize int
+
 	Timeout uint32 // Deprecated - Use Query/ConnectTimeout instead
 }
 
@@ -90,15 +93,33 @@ type Conn struct {
 	wsh           WSHandler
 	prepStmtCache map[string]*prepStmt
 	mux           sync.Mutex
+	ctx           context.Context
+	fetchReqSize  int
+}
+
+type FetchResult struct {
+	Data  []interface{}
+	Error error
 }
 
 func Connect(conf ConnConf) (*Conn, error) {
+	return ConnectContext(conf, context.TODO())
+
+}
+
+func ConnectContext(conf ConnConf, ctx context.Context) (*Conn, error) {
 	c := &Conn{
 		Conf:          conf,
 		Stats:         map[string]int{},
 		log:           conf.Logger,
 		wsh:           conf.WSHandler,
 		prepStmtCache: map[string]*prepStmt{},
+		ctx:           ctx,
+		fetchReqSize:  conf.FetchReqSize,
+	}
+
+	if c.Conf.FetchReqSize <= 0 || c.Conf.FetchReqSize > 64*1024*1024 {
+		c.Conf.FetchReqSize = 64 * 1024 * 1024
 	}
 
 	if c.Conf.Timeout > 0 {
@@ -264,7 +285,7 @@ func (c *Conn) Execute(sql string, args ...interface{}) (rowsAffected int64, err
 //    You can specify it []interface{}
 // 2) Specifying the default schema allows you to use non-schema-qualified
 //    table identifiers in the statement even when you have no schema currently open.
-func (c *Conn) FetchChan(sql string, args ...interface{}) (<-chan []interface{}, error) {
+func (c *Conn) FetchChan(sql string, args ...interface{}) (<-chan FetchResult, error) {
 	var binds []interface{}
 	if len(args) > 0 && args[0] != nil {
 		switch b := args[0].(type) {
@@ -300,7 +321,7 @@ func (c *Conn) FetchChan(sql string, args ...interface{}) (<-chan []interface{},
 		return nil, c.error("Missing websocket API resultset")
 	}
 
-	ch := make(chan []interface{}, 1000)
+	ch := make(chan FetchResult, 1000)
 	go c.resultsToChan(result.ResultSet, ch)
 
 	return ch, nil
@@ -313,7 +334,7 @@ func (c *Conn) FetchSlice(sql string, args ...interface{}) (res [][]interface{},
 		return nil, err
 	}
 	for row := range resChan {
-		res = append(res, row)
+		res = append(res, row.Data)
 	}
 	return res, nil
 }
@@ -478,7 +499,11 @@ func (c *Conn) executePrepStmt(
 	return res, err
 }
 
-func (c *Conn) resultsToChan(rs *resultSet, ch chan<- []interface{}) {
+func (c *Conn) resultsToChan(rs *resultSet, ch chan<- FetchResult) {
+	defer func() {
+		close(ch)
+	}()
+
 	if rs.NumRows == 0 {
 		// Do nothing
 	} else if rs.ResultSetHandle > 0 {
@@ -487,17 +512,23 @@ func (c *Conn) resultsToChan(rs *resultSet, ch chan<- []interface{}) {
 				Command:         "fetch",
 				ResultSetHandle: rs.ResultSetHandle,
 				StartPosition:   i,
-				NumBytes:        64 * 1024 * 1024, // Max allowed
+				NumBytes:        c.Conf.FetchReqSize,
 			}
 			fetchRes := &fetchRes{}
 			err := c.send(fetchReq, fetchRes)
 			if err != nil {
-				// Panic because this routine is async so no good
-				// way to tell the caller that something bad happened
-				panic(err)
+				ch <- FetchResult{Error: err}
+				return
 			}
 			i += fetchRes.ResponseData.NumRows
-			transposeToChan(ch, fetchRes.ResponseData.Data)
+			err = transposeToChan(c.ctx, ch, fetchRes.ResponseData.Data)
+			if err != nil {
+				ch <- FetchResult{
+					Error: err,
+				}
+				c.log.Warning("Error send to result channel:", err)
+				return
+			}
 		}
 
 		closeRSReq := &closeResultSet{
@@ -509,7 +540,13 @@ func (c *Conn) resultsToChan(rs *resultSet, ch chan<- []interface{}) {
 			c.log.Warning("Unable to close result set:", err)
 		}
 	} else {
-		transposeToChan(ch, rs.Data)
+		err := transposeToChan(c.ctx, ch, rs.Data)
+		if err != nil {
+			ch <- FetchResult{
+				Error: err,
+			}
+			c.log.Warning("Error send to result channel:", err)
+			return
+		}
 	}
-	close(ch)
 }
